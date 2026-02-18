@@ -234,7 +234,7 @@ def pdf_to_image():
 def pdf_shrink():
 
     if fitz is None:
-        return jsonify({"error": "PDF shrink unavailable (PyMuPDF not installed)."}), 500
+        return jsonify({"error": "PyMuPDF not installed"}), 500
 
     f = request.files.get("file")
 
@@ -246,35 +246,49 @@ def pdf_shrink():
         original = f.read()
 
         if not original:
-            return jsonify({"error": "Uploaded file is empty"}), 400
+            return jsonify({"error": "Empty file"}), 400
 
-        # Open PDF from memory
         src = fitz.open(stream=original, filetype="pdf")
 
-        # Compress
+        out_doc = fitz.open()
+
+        # Raster compression (major size reduction)
+        for i in range(src.page_count):
+
+            page = src.load_page(i)
+
+            # Lower resolution = smaller file
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2))
+
+            img_bytes = pix.tobytes("jpg")
+
+            new_page = out_doc.new_page(
+                width=page.rect.width,
+                height=page.rect.height
+            )
+
+            new_page.insert_image(
+                new_page.rect,
+                stream=img_bytes
+            )
+
         output = io.BytesIO()
 
-        src.save(
+        out_doc.save(
             output,
-            garbage=4,     # remove unused objects
-            deflate=True,  # compress streams
-            clean=True,    # clean structure
-            linear=True    # optimize for web
+            garbage=4,
+            deflate=True,
+            clean=True
         )
 
         src.close()
+        out_doc.close()
 
         compressed_bytes = output.getvalue()
 
-        # Automatically choose smaller version
-        if len(compressed_bytes) < len(original):
-            final_bytes = compressed_bytes
-        else:
-            final_bytes = original
+        filename = os.path.splitext(f.filename)[0] + "_shrunk.pdf"
 
-        filename = os.path.splitext(f.filename or "compressed")[0] + "_shrunk.pdf"
-
-        response = make_response(final_bytes)
+        response = make_response(compressed_bytes)
 
         response.headers["Content-Type"] = "application/pdf"
         response.headers["Content-Disposition"] = f'attachment; filename=\"{filename}\"'
@@ -283,6 +297,7 @@ def pdf_shrink():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 
 
@@ -332,4 +347,5 @@ def pdf_merge():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
