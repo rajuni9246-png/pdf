@@ -1,16 +1,20 @@
-import io
-import os
+ifrom flask import Flask, request, jsonify, make_response
 import tempfile
 import zipfile
-from datetime import datetime
+import io
+import os
+import sys
 
-from flask import Flask, Response, jsonify, make_response, request
-from openpyxl import Workbook
-from pdf2docx import Converter
-import pdfplumber
-import fitz
+# IMPORTANT: Add this
+try:
+    import fitz  # PyMuPDF
+    print("PyMuPDF version:", fitz.__doc__)
+except ImportError as e:
+    print("PyMuPDF import failed:", e)
+    fitz = None
 
 app = Flask(__name__)
+
 
 
 def _cors(resp):
