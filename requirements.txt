@@ -4,3 +4,5 @@ python-docx==0.8.11
 openpyxl==3.1.2
 PyPDF2==3.0.1
 gunicorn==21.2.0
+PyMuPDF==1.23.26
+Pillow
