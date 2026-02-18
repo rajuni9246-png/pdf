@@ -1,0 +1,13 @@
+Flask==1.1.4
+Werkzeug==1.0.1
+Jinja2==2.11.3
+itsdangerous==1.1.0
+click==7.1.2
+MarkupSafe==1.1.1
+
+PyPDF2==1.26.0
+pdfplumber==0.5.28
+openpyxl==3.0.10
+python-docx==0.8.11
+
+PyMuPDF==1.18.19
