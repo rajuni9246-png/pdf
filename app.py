@@ -232,61 +232,58 @@ def pdf_to_image():
 
 @app.route("/api/pdf-shrink", methods=["POST"])
 def pdf_shrink():
+
     if fitz is None:
-        return jsonify({"error": "PDF shrink unavailable on this host (PyMuPDF not installed)."}), 501
+        return jsonify({"error": "PDF shrink unavailable (PyMuPDF not installed)."}), 500
 
     f = request.files.get("file")
+
     if not f:
         return jsonify({"error": "No file uploaded"}), 400
 
-    level = (request.form.get("level") or "medium").lower()
-    scale = 0.9 if level == "medium" else 0.7
-
     try:
+
         original = f.read()
+
         if not original:
             return jsonify({"error": "Uploaded file is empty"}), 400
 
+        # Open PDF from memory
         src = fitz.open(stream=original, filetype="pdf")
-        page_count = _fitz_page_count(src)
-        if page_count > 120:
-            src.close()
-            return jsonify({"error": "PDF has too many pages for online shrink (max 120 pages)."}), 400
 
-        fast = io.BytesIO()
-        src.save(fast, garbage=3, deflate=True)
-        fast_bytes = fast.getvalue()
-        best_bytes = fast_bytes if len(fast_bytes) < len(original) else original
+        # Compress
+        output = io.BytesIO()
 
-        if level == "high":
-            out_doc = fitz.open()
-            for i in range(page_count):
-                page = _fitz_load_page(src, i)
-                pix = _fitz_get_pixmap(page, scale=scale, alpha=False)
-                jpg = _fitz_pix_to_bytes(pix, "jpg")
-                if hasattr(out_doc, "new_page"):
-                    new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
-                    new_page.insert_image(new_page.rect, stream=jpg)
-                else:
-                    new_page = out_doc.newPage(width=page.rect.width, height=page.rect.height)
-                    new_page.insertImage(new_page.rect, stream=jpg)
-
-            rb = io.BytesIO()
-            out_doc.save(rb, garbage=3, deflate=True)
-            raster = rb.getvalue()
-            out_doc.close()
-            if len(raster) < len(best_bytes):
-                best_bytes = raster
+        src.save(
+            output,
+            garbage=4,     # remove unused objects
+            deflate=True,  # compress streams
+            clean=True,    # clean structure
+            linear=True    # optimize for web
+        )
 
         src.close()
 
+        compressed_bytes = output.getvalue()
+
+        # Automatically choose smaller version
+        if len(compressed_bytes) < len(original):
+            final_bytes = compressed_bytes
+        else:
+            final_bytes = original
+
         filename = os.path.splitext(f.filename or "compressed")[0] + "_shrunk.pdf"
-        resp = make_response(best_bytes)
-        resp.headers["Content-Type"] = "application/pdf"
-        resp.headers["Content-Disposition"] = 'attachment; filename="{}"'.format(filename)
-        return resp
-    except Exception as ex:
-        return jsonify({"error": str(ex)}), 500
+
+        response = make_response(final_bytes)
+
+        response.headers["Content-Type"] = "application/pdf"
+        response.headers["Content-Disposition"] = f'attachment; filename=\"{filename}\"'
+
+        return response
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 
 @app.route("/api/pdf-merge", methods=["POST"])
@@ -335,3 +332,4 @@ def pdf_merge():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
+
