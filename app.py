@@ -1,20 +1,22 @@
-from flask import Flask, request, jsonify, make_response
-import tempfile
-import zipfile
 import io
 import os
-import sys
+import tempfile
+import zipfile
+from datetime import datetime
 
-# IMPORTANT: Add this
+from flask import Flask, jsonify, make_response, request
+
 try:
     import fitz  # PyMuPDF
-    print("PyMuPDF version:", fitz.__doc__)
-except ImportError as e:
-    print("PyMuPDF import failed:", e)
+except Exception:
     fitz = None
 
-app = Flask(__name__)
+import pdfplumber
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+from pdf2docx import Converter
 
+app = Flask(__name__)
 
 
 def _cors(resp):
@@ -29,14 +31,42 @@ def add_cors_headers(resp):
     return _cors(resp)
 
 
-@app.route("/api/health", methods=["GET"])
-def health():
-    return jsonify({"ok": True, "time": datetime.utcnow().isoformat() + "Z"})
-
-
 @app.route("/api/<path:_>", methods=["OPTIONS"])
 def preflight(_):
     return ("", 204)
+
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({
+        "ok": True,
+        "converter": "pdf2docx + pymupdf + pdfplumber",
+        "build": "2026-02-18-excel-text-v2",
+        "excel_mode": "Text_P + Table_P",
+        "pymupdf_loaded": bool(fitz),
+        "time": datetime.utcnow().isoformat() + "Z"
+    })
+
+
+def _fitz_page_count(doc):
+    return getattr(doc, "page_count", getattr(doc, "pageCount", 0))
+
+
+def _fitz_load_page(doc, index):
+    return doc.load_page(index) if hasattr(doc, "load_page") else doc.loadPage(index)
+
+
+def _fitz_get_pixmap(page, scale=2.0, alpha=False):
+    matrix = fitz.Matrix(scale, scale)
+    if hasattr(page, "get_pixmap"):
+        return page.get_pixmap(matrix=matrix, alpha=alpha)
+    return page.getPixmap(matrix=matrix, alpha=alpha)
+
+
+def _fitz_pix_to_bytes(pix, fmt):
+    if hasattr(pix, "tobytes"):
+        return pix.tobytes(fmt)
+    return pix.getImageData(fmt)
 
 
 @app.route("/api/pdf-to-word", methods=["POST"])
@@ -48,24 +78,34 @@ def pdf_to_word():
     src_path = None
     dst_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as src:
-            src.write(f.read())
-            src_path = src.name
+        pdf_bytes = f.read()
+        if not pdf_bytes:
+            return jsonify({"error": "Uploaded file is empty"}), 400
 
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as src:
+            src.write(pdf_bytes)
+            src_path = src.name
         with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as dst:
             dst_path = dst.name
 
-        cv = Converter(src_path)
-        cv.convert(dst_path)
-        cv.close()
+        conversion_error = None
+        try:
+            cv = Converter(src_path)
+            cv.convert(dst_path)
+            cv.close()
+        except Exception as ex:
+            conversion_error = str(ex)
 
-        with open(dst_path, "rb") as out:
-            data = out.read()
+        if conversion_error or (not os.path.exists(dst_path)) or os.path.getsize(dst_path) == 0:
+            return jsonify({"error": "Layout conversion failed: {}".format(conversion_error or "unknown error")}), 500
+        else:
+            with open(dst_path, "rb") as out:
+                data = out.read()
 
         filename = os.path.splitext(f.filename or "converted")[0] + ".docx"
         resp = make_response(data)
         resp.headers["Content-Type"] = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        resp.headers["Content-Disposition"] = 'attachment; filename="{}"'.format(filename)
         return resp
     except Exception as ex:
         return jsonify({"error": str(ex)}), 500
@@ -80,186 +120,201 @@ def pdf_to_word():
 
 @app.route("/api/pdf-to-excel", methods=["POST"])
 def pdf_to_excel():
+    return jsonify({"error": "PDF to Excel module removed in this build."}), 410
+
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "No file uploaded"}), 400
 
-    src_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as src:
-            src.write(f.read())
-            src_path = src.name
+        pdf_bytes = f.read()
+        if not pdf_bytes:
+            return jsonify({"error": "Uploaded file is empty"}), 400
 
         wb = Workbook()
-        first_sheet = True
+        wb.remove(wb.active)
 
-        with pdfplumber.open(src_path) as pdf:
+        ws_readme = wb.create_sheet(title="README")
+        ws_readme["A1"] = "Use Text_P* sheets for editable page text."
+        ws_readme["A2"] = "Use Table_P*_T* sheets for extracted tables."
+        ws_readme["A3"] = "If only NoEditableText is present, the PDF is likely scanned/image-based."
+        ws_readme.column_dimensions["A"].width = 110
+
+        # Reliable editable text sheets from PyMuPDF text extraction.
+        editable_count = 0
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for page_idx in range(_fitz_page_count(doc)):
+            page = _fitz_load_page(doc, page_idx)
+            text = ""
+            try:
+                text = page.get_text("text") if hasattr(page, "get_text") else page.getText("text")
+            except Exception:
+                text = ""
+
+            plain = (text or "").strip()
+            if plain:
+                ws = wb.create_sheet(title=("Text_P{}".format(page_idx + 1))[:31])
+                editable_count += 1
+                for r_idx, line in enumerate(plain.splitlines(), start=1):
+                    ws.cell(row=r_idx, column=1, value=line)
+                ws.column_dimensions["A"].width = 120
+        doc.close()
+
+        # Table sheets provide editable extracted tabular data.
+        table_count = 0
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page_idx, page in enumerate(pdf.pages, start=1):
                 tables = page.extract_tables() or []
-                if not tables:
-                    continue
-
                 for t_idx, table in enumerate(tables, start=1):
-                    title = f"P{page_idx}_T{t_idx}"
-                    ws = wb.active if first_sheet else wb.create_sheet()
-                    first_sheet = False
-                    ws.title = title[:31]
-
+                    table_count += 1
+                    ws = wb.create_sheet(title=("Table_P{}_T{}".format(page_idx, t_idx))[:31])
+                    max_cols = 0
                     for r_idx, row in enumerate(table, start=1):
                         if row is None:
                             continue
+                        max_cols = max(max_cols, len(row))
                         for c_idx, cell in enumerate(row, start=1):
                             ws.cell(row=r_idx, column=c_idx, value=(cell or "").strip())
+                    for c_idx in range(1, max_cols + 1):
+                        ws.column_dimensions[get_column_letter(c_idx)].width = 22
 
-        if first_sheet:
-            ws = wb.active
-            ws.title = "NoTables"
-            ws["A1"] = "No tables detected in PDF."
+        if editable_count == 0 and table_count == 0:
+            ws = wb.create_sheet(title="NoEditableText")
+            ws["A1"] = "No editable text detected. This PDF may be scanned/image-based."
+            ws["A2"] = "Use OCR-enabled conversion for editable output."
 
-        buf = io.BytesIO()
-        wb.save(buf)
-        buf.seek(0)
+        out = io.BytesIO()
+        wb.save(out)
+        out.seek(0)
 
         filename = os.path.splitext(f.filename or "converted")[0] + ".xlsx"
-        resp = make_response(buf.getvalue())
+        resp = make_response(out.getvalue())
         resp.headers["Content-Type"] = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        resp.headers["Content-Disposition"] = 'attachment; filename="{}"'.format(filename)
         return resp
     except Exception as ex:
         return jsonify({"error": str(ex)}), 500
-    finally:
-        if src_path and os.path.exists(src_path):
-            try:
-                os.remove(src_path)
-            except Exception:
-                pass
 
 
 @app.route("/api/pdf-to-image", methods=["POST"])
 def pdf_to_image():
+    if fitz is None:
+        return jsonify({"error": "PDF to image unavailable on this host (PyMuPDF not installed)."}), 501
+
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "No file uploaded"}), 400
 
-    src_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as src:
-            src.write(f.read())
-            src_path = src.name
+        pdf_bytes = f.read()
+        if not pdf_bytes:
+            return jsonify({"error": "Uploaded file is empty"}), 400
 
-        doc = fitz.open(src_path)
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         out = io.BytesIO()
         with zipfile.ZipFile(out, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for i, page in enumerate(doc, start=1):
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                png = pix.tobytes("png")
-                zf.writestr(f"page-{i}.png", png)
-        doc.close()
+            for i in range(_fitz_page_count(doc)):
+                page = _fitz_load_page(doc, i)
+                pix = _fitz_get_pixmap(page, scale=2.0, alpha=False)
+                zf.writestr("page-{}.png".format(i + 1), _fitz_pix_to_bytes(pix, "png"))
 
+        doc.close()
         out.seek(0)
+
         filename = os.path.splitext(f.filename or "converted")[0] + "_images.zip"
         resp = make_response(out.getvalue())
         resp.headers["Content-Type"] = "application/zip"
-        resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        resp.headers["Content-Disposition"] = 'attachment; filename="{}"'.format(filename)
         return resp
     except Exception as ex:
         return jsonify({"error": str(ex)}), 500
-    finally:
-        if src_path and os.path.exists(src_path):
-            try:
-                os.remove(src_path)
-            except Exception:
-                pass
-
 
 
 @app.route("/api/pdf-shrink", methods=["POST"])
 def pdf_shrink():
+    if fitz is None:
+        return jsonify({"error": "PDF shrink unavailable on this host (PyMuPDF not installed)."}), 501
+
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "No file uploaded"}), 400
 
     level = (request.form.get("level") or "medium").lower()
-    raster_scale = 0.9
+    scale = 0.9 if level == "medium" else 0.7
 
-    original_bytes = f.read()
-    if not original_bytes:
-        return jsonify({"error": "Uploaded file is empty"}), 400
-
-    src = None
-    out_doc = None
     try:
-        # Fast pass: optimize PDF objects only.
-        src = fitz.open(stream=original_bytes, filetype="pdf")
-        if src.page_count > 120:
+        original = f.read()
+        if not original:
+            return jsonify({"error": "Uploaded file is empty"}), 400
+
+        src = fitz.open(stream=original, filetype="pdf")
+        page_count = _fitz_page_count(src)
+        if page_count > 120:
+            src.close()
             return jsonify({"error": "PDF has too many pages for online shrink (max 120 pages)."}), 400
 
-        optimized_buf = io.BytesIO()
-        src.save(optimized_buf, garbage=3, deflate=True)
-        optimized_bytes = optimized_buf.getvalue()
-        src.close()
-        src = None
+        fast = io.BytesIO()
+        src.save(fast, garbage=3, deflate=True)
+        fast_bytes = fast.getvalue()
+        best_bytes = fast_bytes if len(fast_bytes) < len(original) else original
 
-        best_bytes = optimized_bytes if len(optimized_bytes) <= len(original_bytes) else original_bytes
-
-        # Slow raster pass only for explicit high compression.
         if level == "high":
-            src = fitz.open(stream=original_bytes, filetype="pdf")
             out_doc = fitz.open()
-            for page in src:
-                pix = page.get_pixmap(matrix=fitz.Matrix(raster_scale, raster_scale), alpha=False)
-                jpg = pix.tobytes("jpg")
-                new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
-                new_page.insert_image(new_page.rect, stream=jpg)
+            for i in range(page_count):
+                page = _fitz_load_page(src, i)
+                pix = _fitz_get_pixmap(page, scale=scale, alpha=False)
+                jpg = _fitz_pix_to_bytes(pix, "jpg")
+                if hasattr(out_doc, "new_page"):
+                    new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
+                    new_page.insert_image(new_page.rect, stream=jpg)
+                else:
+                    new_page = out_doc.newPage(width=page.rect.width, height=page.rect.height)
+                    new_page.insertImage(new_page.rect, stream=jpg)
 
-            raster_buf = io.BytesIO()
-            out_doc.save(raster_buf, garbage=3, deflate=True)
-            raster_bytes = raster_buf.getvalue()
-            if len(raster_bytes) < len(best_bytes):
-                best_bytes = raster_bytes
+            rb = io.BytesIO()
+            out_doc.save(rb, garbage=3, deflate=True)
+            raster = rb.getvalue()
+            out_doc.close()
+            if len(raster) < len(best_bytes):
+                best_bytes = raster
+
+        src.close()
 
         filename = os.path.splitext(f.filename or "compressed")[0] + "_shrunk.pdf"
         resp = make_response(best_bytes)
         resp.headers["Content-Type"] = "application/pdf"
-        resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        resp.headers["Content-Disposition"] = 'attachment; filename="{}"'.format(filename)
         return resp
     except Exception as ex:
         return jsonify({"error": str(ex)}), 500
-    finally:
-        if src is not None:
-            try:
-                src.close()
-            except Exception:
-                pass
-        if out_doc is not None:
-            try:
-                out_doc.close()
-            except Exception:
-                pass
+
 
 @app.route("/api/pdf-merge", methods=["POST"])
 def pdf_merge():
+    if fitz is None:
+        return jsonify({"error": "PDF merge unavailable on this host (PyMuPDF not installed)."}), 501
+
     files = request.files.getlist("files")
     if not files:
         return jsonify({"error": "No files uploaded"}), 400
 
-    valid_files = [f for f in files if f and (f.filename or "").lower().endswith(".pdf")]
-    if len(valid_files) < 2:
+    pdf_files = [x for x in files if x and (x.filename or "").lower().endswith(".pdf")]
+    if len(pdf_files) < 2:
         return jsonify({"error": "Upload at least 2 PDF files"}), 400
 
     merged = fitz.open()
     opened_docs = []
     try:
-        for f in valid_files:
+        for f in pdf_files:
             doc = fitz.open(stream=f.read(), filetype="pdf")
             opened_docs.append(doc)
             merged.insert_pdf(doc)
 
-        buf = io.BytesIO()
-        merged.save(buf, garbage=4, deflate=True, clean=True, linear=True)
-        buf.seek(0)
+        out = io.BytesIO()
+        merged.save(out, garbage=4, deflate=True, clean=True, linear=True)
+        out.seek(0)
 
-        resp = make_response(buf.getvalue())
+        resp = make_response(out.getvalue())
         resp.headers["Content-Type"] = "application/pdf"
         resp.headers["Content-Disposition"] = 'attachment; filename="merged.pdf"'
         return resp
@@ -275,9 +330,8 @@ def pdf_merge():
             merged.close()
         except Exception:
             pass
+
+
 if __name__ == "__main__":
-      port = int(os.environ.get("PORT", 5000))
-      app.run(host="0.0.0.0", port=port, debug=False)
-
-
-
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
